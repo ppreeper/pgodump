@@ -3,12 +3,7 @@ package database
 import (
 	"context"
 	"fmt"
-	"time"
 )
-
-//########
-// Schemas
-//########
 
 // Schema struct to hold schemas
 type Schema struct {
@@ -16,18 +11,32 @@ type Schema struct {
 }
 
 // GetSchemas returns schema list
-func (db *Database) GetSchemas() []Schema {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(db.Timeout)*time.Second)
+func (db *Database) GetSchemas(ctx context.Context) ([]Schema, error) {
+	ctx, cancel := db.withTimeout(ctx)
 	defer cancel()
-	q := `select schema_name
-		from information_schema.schemata
-		where schema_name not in ('pg_catalog','information_schema')
-		order by schema_name`
-	fmt.Println(q)
-	ss := []Schema{}
-	if err := db.SelectContext(ctx, &ss, q); err != nil {
-		fmt.Println("Error getting schemas:", err)
-		return ss
+
+	// Use pg_namespace to get user schemas.
+	// Filter out internal postgres schemas.
+	q := `
+		SELECT nspname AS schema_name
+		FROM pg_namespace
+		WHERE nspname NOT LIKE 'pg_%'
+			AND nspname != 'information_schema'`
+
+	if len(db.IncludeSchemas) > 0 {
+		q += " AND nspname = ANY($1)"
 	}
-	return ss
+	q += " ORDER BY nspname;"
+
+	ss := []Schema{}
+	var err error
+	if len(db.IncludeSchemas) > 0 {
+		err = db.SelectContext(ctx, &ss, q, db.IncludeSchemas)
+	} else {
+		err = db.SelectContext(ctx, &ss, q)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("GetSchemas: %w", err)
+	}
+	return ss, nil
 }

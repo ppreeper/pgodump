@@ -3,69 +3,88 @@ package database
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
-	"time"
-
-	ec "github.com/ppreeper/pgodump/errcheck"
 )
 
-//########
-// Views
-//########
-
-// View list of views
 type View struct {
-	Name       string `db:"TABLE_NAME"`
-	Definition string `db:"VIEW_DEFINITION"`
+	Name       string `db:"view_name"`
+	Definition string `db:"view_def"`
 }
 
-type ViewList struct {
-	Name string `db:"TABLE_NAME"`
-}
-
-// GetViews returns list of views and definitions
-func (db *Database) GetViews(schema string, timeout int) ([]ViewList, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+func (db *Database) GetViewDetails(ctx context.Context, schema, view string) (string, error) {
+	ctx, cancel := db.withTimeout(ctx)
 	defer cancel()
-	q := ""
-	q += `SELECT TABLE_NAME AS "TABLE_NAME"
-		FROM INFORMATION_SCHEMA.VIEWS
-		WHERE TABLE_SCHEMA = $1
-		ORDER BY TABLE_NAME`
 
-	vv := []ViewList{}
-	if err := db.SelectContext(ctx, &vv, q, schema); err != nil {
-		return nil, fmt.Errorf("select: %w", err)
+	q := `
+		SELECT
+			c.relname AS view_name,
+			pg_get_viewdef(c.oid) AS view_def
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2
+		AND c.relkind = 'v';`
+
+	var v View
+	if err := db.GetContext(ctx, &v, q, schema, view); err != nil {
+		return "", fmt.Errorf("get view %s.%s: %w", schema, view, err)
 	}
-	return vv, nil
+
+	var b strings.Builder
+	b.WriteString(header(fmt.Sprintf("Name: %s; Type: VIEW; Schema: %s; Owner: -", v.Name, schema)))
+	if db.IfExists {
+		fmt.Fprintf(&b, "CREATE VIEW IF NOT EXISTS %s.%s AS\n%s;\n\n",
+			QuoteIdentifier(schema), QuoteIdentifier(v.Name), strings.TrimSuffix(v.Definition, ";"))
+	} else {
+		fmt.Fprintf(&b, "CREATE VIEW %s.%s AS\n%s;\n\n",
+			QuoteIdentifier(schema), QuoteIdentifier(v.Name), strings.TrimSuffix(v.Definition, ";"))
+	}
+	aclSQL, err := db.GetOwnershipAndPrivileges(ctx, schema, view, "VIEW")
+	if err != nil {
+		return "", fmt.Errorf("get ACL for view %s.%s: %w", schema, view, err)
+	}
+	b.WriteString(aclSQL)
+	return b.String(), nil
 }
 
-// GetViewSchema returns views and definition
-func (db *Database) GetViewSchema(schema, view string) (View, error) {
-	q := ""
-	q += `SELECT TABLE_NAME AS "TABLE_NAME", VIEW_DEFINITION AS "VIEW_DEFINITION"
-		FROM INFORMATION_SCHEMA.VIEWS
-		WHERE TABLE_SCHEMA = $1 AND TABLE_NAME = $2
-		ORDER BY TABLE_NAME`
-	vv := View{}
-	if err := db.Get(&vv, q, schema, view); err != nil {
-		return View{}, fmt.Errorf("select: %w", err)
+// GetMatViewDetails returns the DDL for a materialized view.
+func (db *Database) GetMatViewDetails(ctx context.Context, schema, matview string) (string, error) {
+	ctx, cancel := db.withTimeout(ctx)
+	defer cancel()
+
+	q := `
+		SELECT
+			c.relname AS view_name,
+			pg_get_viewdef(c.oid) AS view_def
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2
+		AND c.relkind = 'm';`
+
+	var v View
+	if err := db.GetContext(ctx, &v, q, schema, matview); err != nil {
+		return "", fmt.Errorf("get materialized view %s.%s: %w", schema, matview, err)
 	}
-	return vv, nil
-}
 
-// GetView gets view definition
-func (db *Database) GetView(d Database, schema string, view View, dbg bool) {
-	q := ""
-	q += "DROP VIEW " + schema + "." + view.Name + ";\n"
-	q += "CREATE VIEW " + schema + "." + view.Name + " AS \n"
-	q += view.Definition
+	var b strings.Builder
+	b.WriteString(header(fmt.Sprintf("Name: %s; Type: MATERIALIZED VIEW; Schema: %s; Owner: -", v.Name, schema)))
+	if db.IfExists {
+		fmt.Fprintf(&b, "CREATE MATERIALIZED VIEW IF NOT EXISTS %s.%s AS\n%s\nWITH NO DATA;\n\n",
+			QuoteIdentifier(schema), QuoteIdentifier(v.Name), strings.TrimSuffix(v.Definition, ";"))
+	} else {
+		fmt.Fprintf(&b, "CREATE MATERIALIZED VIEW %s.%s AS\n%s\nWITH NO DATA;\n\n",
+			QuoteIdentifier(schema), QuoteIdentifier(v.Name), strings.TrimSuffix(v.Definition, ";"))
+	}
 
-	t := strings.Replace(view.Name, "/", "_", -1)
-	fname := fmt.Sprintf("%s.%s.%s.VIEW.sql", d.Database, schema, t)
-	f, err := os.Create(fname)
-	ec.CheckErr(err)
-	defer f.Close()
-	f.Write([]byte(q))
+	indexSQL, err := db.GetTableIndexes(ctx, schema, matview)
+	if err != nil {
+		return "", fmt.Errorf("get indexes for matview %s.%s: %w", schema, matview, err)
+	}
+	b.WriteString(indexSQL)
+
+	aclSQL, err := db.GetOwnershipAndPrivileges(ctx, schema, matview, "MATERIALIZED VIEW")
+	if err != nil {
+		return "", fmt.Errorf("get ACL for matview %s.%s: %w", schema, matview, err)
+	}
+	b.WriteString(aclSQL)
+	return b.String(), nil
 }

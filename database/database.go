@@ -1,63 +1,92 @@
 package database
 
 import (
+	"context"
 	"fmt"
+	"net/url"
+	"strings"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/jmoiron/sqlx"
-	ec "github.com/ppreeper/pgodump/errcheck"
 )
 
-// Database struct contains sql pointer
+// Database holds connection config and a live *sqlx.DB.
 type Database struct {
-	Name                string
-	Hostname            string
-	Port                int
-	Database            string
-	Username            string
-	Password            string
-	URI                 string
-	Timeout             int `default:"10"`
-	Verbose             bool
-	DataOnly            bool
-	SchemaOnly          bool
-	IfExists            bool
-	Inserts             bool
-	NoComments          bool
-	OnConflictDoNothing bool
-	File                string
+	Hostname       string
+	Port           int
+	Database       string
+	Username       string
+	Password       string
+	URI            string
+	SSLMode        string // default "disable"
+	Timeout        int
+	DataOnly       bool
+	SchemaOnly     bool
+	IfExists       bool
+	File           string
+	IncludeSchemas []string
+	IncludeTables  []string
+	NoOwner        bool
+	NoPrivileges   bool
 	*sqlx.DB
 }
 
 func NewDatabase() *Database {
 	return &Database{
 		Timeout: 10,
+		SSLMode: "disable",
 	}
 }
 
-func (db *Database) OpenDatabase() {
-	var err error
+func (db *Database) OpenDatabase() error {
 	db.getURI()
-	db.DB, err = sqlx.Open("pgx", db.URI)
-	ec.FatalErr(err, "cannot open database")
-	if err = db.Ping(); err != nil {
-		ec.FatalErr(err, "cannot ping database")
+	conn, err := sqlx.Open("pgx", db.URI)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
 	}
+	if err = conn.Ping(); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("ping: %w", err)
+	}
+	db.DB = conn
+	return nil
 }
 
-// GenURI generate db uri string
+// getURI builds the DSN, percent-encoding credentials to handle special characters.
 func (db *Database) getURI() {
+	if db.URI != "" {
+		return
+	}
 	port := 5432
 	if db.Port != 0 {
 		port = db.Port
 	}
-	db.URI = fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable", db.Username, db.Password, db.Hostname, port, db.Database)
+	sslMode := db.SSLMode
+	if sslMode == "" {
+		sslMode = "disable"
+	}
+	u := &url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(db.Username, db.Password),
+		Host:     fmt.Sprintf("%s:%d", db.Hostname, port),
+		Path:     db.Database,
+		RawQuery: "sslmode=" + sslMode,
+	}
+	db.URI = u.String()
+}
+
+// withTimeout derives a child context with the configured query timeout.
+func (db *Database) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, time.Duration(db.Timeout)*time.Second)
 }
 
 func header(title string) string {
-	return fmt.Sprintf("\n--\n-- %s\n--\n\n", title)
-}
-
-func comment(text string) string {
-	return fmt.Sprintf("-- %s\n", text)
+	// Keep generated SQL metadata comments single-line so object names cannot
+	// inject additional SQL/comment lines in dump output.
+	title = strings.ReplaceAll(title, "\n", " ")
+	title = strings.ReplaceAll(title, "\r", " ")
+	// Prevent embedded "--" from starting a new SQL comment within the line.
+	title = strings.ReplaceAll(title, "--", "- -")
+	return fmt.Sprintf("\n-- %s\n", title)
 }
